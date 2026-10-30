@@ -3,8 +3,10 @@ FPL API - a small web service that returns live Fantasy Premier League data.
 
 Needs fpl_fetch.py in the same folder (it reuses that file's code).
 
+Open the main address in a browser to see the dashboard (web app).
+
 Endpoints (all return JSON unless noted):
-    /                      list of endpoints
+    /api                   list of endpoints
     /status                current + next gameweek and deadlines
     /team/<id>             a manager's summary and squad  (optional ?gw=10)
     /players               players list  (?sort=form&limit=20&position=MID&team=ARS)
@@ -105,7 +107,317 @@ def player_dict(p, teams, fixtures=None, from_gw=None):
 
 
 # ---- Endpoints ----
+APP_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FPL Dashboard</title>
+<style>
+:root{--bg:#f6f4f8;--card:#fff;--ink:#1d1d1f;--mute:#6b6b76;--line:#e3e0ea;--brand:#37003c;--accent:#00a35a;--warn:#c2410c;--warnbg:#fff1e6}
+@media (prefers-color-scheme:dark){:root{--bg:#14101a;--card:#1f1a28;--ink:#f1eef6;--mute:#a49fb2;--line:#322b3f;--brand:#4a1156;--accent:#2ee59d;--warn:#fb923c;--warnbg:#3a2314}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+header{background:var(--brand);color:#fff;padding:14px 16px;display:flex;flex-wrap:wrap;gap:6px 24px;align-items:center;justify-content:space-between}
+header h1{margin:0;font-size:20px}
+#deadline{font-size:14px;text-align:right}
+#deadline b{color:#00ff87}
+nav{display:flex;gap:4px;padding:10px 12px 0;overflow-x:auto}
+nav button{border:1px solid var(--line);border-bottom:none;background:var(--card);color:var(--mute);padding:9px 16px;border-radius:10px 10px 0 0;font:inherit;cursor:pointer;white-space:nowrap}
+nav button.on{color:var(--ink);font-weight:600;border-top:3px solid var(--accent)}
+main{background:var(--card);border-top:1px solid var(--line);padding:16px;min-height:60vh}
+section{display:none;max-width:1000px;margin:0 auto}
+section.on{display:block}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
+input,select,button.act{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
+input{width:110px}
+button.act{background:var(--accent);color:#fff;border:none;font-weight:600;cursor:pointer}
+.msg{color:var(--mute);padding:12px 0}
+.err{color:var(--warn);background:var(--warnbg);padding:10px 12px;border-radius:8px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+.stat{border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.stat span{display:block;font-size:12px;color:var(--mute)}
+.stat b{font-size:16px}
+.stat small{display:block;color:var(--mute);font-size:12px}
+.flags{background:var(--warnbg);color:var(--warn);border-radius:10px;padding:10px 14px;margin-bottom:14px}
+.flags ul{margin:4px 0 0;padding-left:18px}
+.pitch{background:linear-gradient(#e9f7ee,#d4f0df);border-radius:12px;padding:10px 6px}
+@media (prefers-color-scheme:dark){.pitch{background:linear-gradient(#17301f,#122618)}}
+.row{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin:8px 0}
+.card{flex:1 1 130px;max-width:165px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 10px;text-align:center}
+.card.flag{border-color:var(--warn);box-shadow:0 0 0 1px var(--warn)}
+.nm{font-weight:700}
+.sub{font-size:12px;color:var(--mute)}
+.ep{font-size:12px;display:flex;justify-content:center;gap:10px;margin:4px 0}
+.bdg{display:inline-block;margin-left:4px;font-size:11px;border-radius:50%;width:18px;height:18px;line-height:18px;color:#fff}
+.bdg.c{background:#111}.bdg.v{background:#6b6b76}
+.benchbox{margin-top:14px;border:1px dashed var(--line);border-radius:12px;padding:6px}
+.benchbox h3{margin:4px 8px;font-size:13px;color:var(--mute);font-weight:600}
+.fxs{display:flex;gap:3px;justify-content:center;flex-wrap:wrap}
+.fx{font-size:11px;font-weight:600;padding:2px 5px;border-radius:5px;display:inline-block}
+.d1{background:#1b7f4b;color:#fff}.d2{background:#4cc27f;color:#06260f}.d3{background:#d9d9de;color:#222}.d4{background:#f08a4b;color:#2a1000}.d5{background:#d13b3b;color:#fff}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{padding:7px 9px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{color:var(--mute);font-size:12px;font-weight:600}
+td.blank{color:var(--mute);text-align:center}
+.legend{font-size:12px;color:var(--mute);margin:8px 0}
+textarea{width:100%;height:260px;font:12px/1.4 ui-monospace,Menlo,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:10px}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚽ FPL Dashboard</h1>
+  <div id="deadline">Loading deadline…</div>
+</header>
+<nav id="tabs">
+  <button class="on" data-tab="team">My Team</button>
+  <button data-tab="players">Players</button>
+  <button data-tab="fixtures">Fixtures</button>
+  <button data-tab="claude">For Claude</button>
+</nav>
+<main>
+  <section id="team" class="on">
+    <div class="bar">
+      <label for="tid">Team ID</label>
+      <input id="tid" inputmode="numeric" value="__DEFAULT_TEAM__">
+      <button class="act" id="loadTeam">Load team</button>
+    </div>
+    <div id="teamOut"></div>
+  </section>
+
+  <section id="players">
+    <div class="bar">
+      <select id="pPos"><option value="">All positions</option><option>GK</option><option>DEF</option><option>MID</option><option>FWD</option></select>
+      <select id="pSort">
+        <option value="ep_next">Expected points next GW</option>
+        <option value="form">Form</option>
+        <option value="total_points">Total points</option>
+        <option value="points_per_game">Points per game</option>
+        <option value="xgi">xGI</option>
+        <option value="price">Price</option>
+        <option value="owned">Ownership</option>
+        <option value="transfers_in">Transfers in</option>
+      </select>
+      <input id="pTeam" placeholder="Club e.g. ARS" maxlength="3" style="width:130px">
+      <select id="pLimit"><option>20</option><option>40</option><option>100</option></select>
+      <button class="act" id="loadPlayers">Show</button>
+    </div>
+    <div id="playersOut"></div>
+  </section>
+
+  <section id="fixtures">
+    <div class="legend">Colour = FPL difficulty (1 easy, 5 hard). CAPITALS = home game, lowercase = away.</div>
+    <div id="fixturesOut"></div>
+  </section>
+
+  <section id="claude">
+    <p>Copy the full report and paste it into any Claude chat to get advice, for example if your project can't open the link.</p>
+    <div class="bar"><button class="act" id="copySnap">Copy report for Claude</button><span id="copyMsg" class="msg"></span></div>
+    <textarea id="snapTxt" readonly placeholder="The report will appear here"></textarea>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const KEY = new URLSearchParams(location.search).get('key');
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money = n => '£' + Number(n).toFixed(1) + 'm';
+const fmt = n => Number(n).toLocaleString('en-IN');
+const WAIT = '<p class="msg">Loading… the free server can take up to a minute to wake up.</p>';
+
+async function api(path) {
+  let u = path;
+  if (KEY) u += (u.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(KEY);
+  const r = await fetch(u);
+  if (!r.ok) {
+    let m = '';
+    try { m = (await r.json()).error; } catch (e) {}
+    throw new Error(m || ('Error ' + r.status));
+  }
+  return r;
+}
+
+function parseFx(s) {
+  const out = [];
+  if (!s || s === '-') return out;
+  const re = /GW(\d+) ([^\s(]+)\((H|A)\)\[(\d)\]/g;
+  let m;
+  while ((m = re.exec(s))) out.push({gw: +m[1], opp: m[2], ha: m[3], d: +m[4]});
+  return out;
+}
+const fxSpan = f => `<span class="fx d${f.d}" title="GW${f.gw}">${esc(f.ha === 'H' ? f.opp.toUpperCase() : f.opp.toLowerCase())}</span>`;
+const fxChips = (s, n) => parseFx(s).slice(0, n).map(fxSpan).join('');
+
+/* ---------- Deadline ---------- */
+let DEADLINE = null, GWNAME = '';
+async function loadStatus() {
+  try {
+    const s = await (await api('/status')).json();
+    const n = s.next_gameweek;
+    if (!n) { $('#deadline').textContent = 'No upcoming gameweek'; return; }
+    DEADLINE = new Date(n.deadline_time);
+    GWNAME = n.name;
+    tick();
+    setInterval(tick, 1000);
+  } catch (e) {
+    $('#deadline').textContent = 'Deadline unavailable';
+  }
+}
+function tick() {
+  if (!DEADLINE) return;
+  const ms = DEADLINE - Date.now();
+  const ist = DEADLINE.toLocaleString('en-IN', {timeZone: 'Asia/Kolkata', weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true});
+  if (ms <= 0) { $('#deadline').innerHTML = esc(GWNAME) + ' deadline passed (' + esc(ist) + ' IST)'; return; }
+  const d = Math.floor(ms / 864e5), h = Math.floor(ms % 864e5 / 36e5), m = Math.floor(ms % 36e5 / 6e4), sec = Math.floor(ms % 6e4 / 1e3);
+  $('#deadline').innerHTML = esc(GWNAME) + ' deadline: <b>' + esc(ist) + ' IST</b><br>' + (d ? d + 'd ' : '') + h + 'h ' + m + 'm ' + sec + 's left';
+}
+
+/* ---------- My Team ---------- */
+const stat = (l, v, sub) => `<div class="stat"><span>${esc(l)}</span><b>${esc(v)}</b><small>${esc(sub || '')}</small></div>`;
+const isFlagged = p => (p.chance_of_playing_next_round != null && p.chance_of_playing_next_round < 75) || (p.status !== 'a' && p.news);
+
+function card(p) {
+  const badge = p.captain ? '<b class="bdg c">C</b>' : (p.vice_captain ? '<b class="bdg v">V</b>' : '');
+  return `<div class="card${isFlagged(p) ? ' flag' : ''}"><div class="nm">${esc(p.name)}${badge}</div>` +
+    `<div class="sub">${esc(p.team)} · ${money(p.price)}</div>` +
+    `<div class="ep"><span>xP <b>${p.expected_points_next}</b></span><span>Form <b>${p.form}</b></span></div>` +
+    `<div class="fxs">${fxChips(p.next_fixtures, 4)}</div></div>`;
+}
+
+function renderTeam(t) {
+  const chips = (t.chips_used || []).map(c => c.chip + ' (GW' + c.gameweek + ')').join(', ') || 'none yet';
+  let html = '<div class="stats">' +
+    stat('Team', t.team_name, t.manager) +
+    stat('Overall rank', fmt(t.overall_rank), fmt(t.overall_points) + ' pts') +
+    stat('Last GW', t.last_gw_points + ' pts', 'Squad shown: GW' + t.squad_gameweek) +
+    stat('Bank', money(t.bank), 'Value ' + money(t.squad_value)) +
+    stat('Transfers made', t.total_transfers, '') +
+    stat('Chips used', chips, '') + '</div>';
+
+  if (!t.squad) { $('#teamOut').innerHTML = html + '<p class="msg">Squad not available for this gameweek.</p>'; return; }
+
+  const xi = t.squad.filter(p => p.slot !== 'bench');
+  const bench = t.squad.filter(p => p.slot === 'bench');
+
+  const flags = [];
+  t.squad.forEach(p => {
+    if (isFlagged(p)) {
+      const c = p.chance_of_playing_next_round;
+      flags.push(`${p.name} (${p.slot === 'bench' ? 'bench' : 'XI'}): ${p.news || 'flagged'}${c != null ? ' (' + c + '% to play)' : ''}`);
+    }
+  });
+  const xiEp = xi.filter(p => p.position !== 'GK').map(p => p.expected_points_next);
+  const minXi = xiEp.length ? Math.min(...xiEp) : 0;
+  bench.forEach(p => {
+    if (p.position === 'GK') return;
+    if (p.expected_points_next < 1) flags.push(`${p.name} (bench): expects under 1 point, a dead slot`);
+    else if (p.expected_points_next > minXi) flags.push(`${p.name} (bench): expects more than your weakest starter (${p.expected_points_next} vs ${minXi})`);
+  });
+  if (flags.length) html += '<div class="flags"><b>⚠ Check these</b><ul>' + flags.map(f => '<li>' + esc(f) + '</li>').join('') + '</ul></div>';
+
+  html += '<div class="pitch">';
+  ['GK', 'DEF', 'MID', 'FWD'].forEach(pos => {
+    html += '<div class="row">' + xi.filter(p => p.position === pos).map(card).join('') + '</div>';
+  });
+  html += '</div>';
+  html += '<div class="benchbox"><h3>BENCH (in order)</h3><div class="row">' + bench.map(card).join('') + '</div></div>';
+  html += '<p class="legend">xP = FPL\'s expected points for the next gameweek. Chips show the next 4 fixtures. The squad is as locked at the last deadline.</p>';
+  $('#teamOut').innerHTML = html;
+}
+
+async function loadTeam() {
+  const id = $('#tid').value.trim();
+  if (!/^\d+$/.test(id)) { $('#teamOut').innerHTML = '<p class="err">Enter your team ID (numbers only).</p>'; return; }
+  try { localStorage.setItem('fpl_tid', id); } catch (e) {}
+  $('#teamOut').innerHTML = WAIT;
+  try { renderTeam(await (await api('/team/' + id)).json()); }
+  catch (e) { $('#teamOut').innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+
+/* ---------- Players ---------- */
+async function loadPlayers() {
+  const q = new URLSearchParams({sort: $('#pSort').value, limit: $('#pLimit').value});
+  if ($('#pPos').value) q.set('position', $('#pPos').value);
+  const club = $('#pTeam').value.trim();
+  if (club) q.set('team', club);
+  $('#playersOut').innerHTML = WAIT;
+  try {
+    const d = await (await api('/players?' + q.toString())).json();
+    if (!d.players.length) { $('#playersOut').innerHTML = '<p class="msg">No players found.</p>'; return; }
+    let h = '<div class="scroll"><table><tr><th>Player</th><th>Pos</th><th>Team</th><th>Price</th><th>Form</th><th>xP next</th><th>Pts</th><th>Owned</th><th>Status</th></tr>';
+    d.players.forEach(p => {
+      const c = p.chance_of_playing_next_round;
+      const st = isFlagged(p) ? (p.news || 'flagged') + (c != null ? ' (' + c + '%)' : '') : '';
+      h += `<tr><td><b>${esc(p.name)}</b></td><td>${esc(p.position)}</td><td>${esc(p.team)}</td><td>${money(p.price)}</td><td>${p.form}</td><td>${p.expected_points_next}</td><td>${p.total_points}</td><td>${p.owned_by_percent}%</td><td>${esc(st)}</td></tr>`;
+    });
+    $('#playersOut').innerHTML = h + '</table></div>';
+  } catch (e) { $('#playersOut').innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+
+/* ---------- Fixtures ---------- */
+async function loadFixtures() {
+  $('#fixturesOut').innerHTML = WAIT;
+  try {
+    const d = await (await api('/fixtures?n=6')).json();
+    const gws = [];
+    for (let i = 0; i < d.gameweeks_shown; i++) gws.push(d.from_gameweek + i);
+    let h = '<div class="scroll"><table><tr><th>Team</th>' + gws.map(g => '<th>GW' + g + '</th>').join('') + '</tr>';
+    d.teams.forEach(t => {
+      const fx = parseFx(t.fixtures);
+      h += '<tr><td><b>' + esc(t.team) + '</b></td>' + gws.map(g => {
+        const list = fx.filter(f => f.gw === g);
+        return list.length ? '<td>' + list.map(fxSpan).join(' ') + '</td>' : '<td class="blank">–</td>';
+      }).join('') + '</tr>';
+    });
+    $('#fixturesOut').innerHTML = h + '</table></div>';
+  } catch (e) { $('#fixturesOut').innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+
+/* ---------- For Claude ---------- */
+async function copySnap() {
+  const id = $('#tid').value.trim() || '__DEFAULT_TEAM__';
+  $('#copyMsg').textContent = 'Loading…';
+  try {
+    const txt = await (await api('/snapshot/' + id)).text();
+    $('#snapTxt').value = txt;
+    try { await navigator.clipboard.writeText(txt); $('#copyMsg').textContent = 'Copied! Paste it into Claude.'; }
+    catch (e) { $('#copyMsg').textContent = 'Select the text below and copy it.'; }
+  } catch (e) { $('#copyMsg').textContent = e.message; }
+}
+
+/* ---------- Tabs and start-up ---------- */
+const loaded = {};
+document.querySelectorAll('#tabs button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#tabs button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('main section').forEach(s => s.classList.toggle('on', s.id === b.dataset.tab));
+  if (!loaded[b.dataset.tab]) {
+    loaded[b.dataset.tab] = true;
+    if (b.dataset.tab === 'players') loadPlayers();
+    if (b.dataset.tab === 'fixtures') loadFixtures();
+  }
+}));
+$('#loadTeam').addEventListener('click', loadTeam);
+$('#loadPlayers').addEventListener('click', loadPlayers);
+$('#copySnap').addEventListener('click', copySnap);
+$('#tid').addEventListener('keydown', e => { if (e.key === 'Enter') loadTeam(); });
+try { const saved = localStorage.getItem('fpl_tid'); if (saved) $('#tid').value = saved; } catch (e) {}
+loadStatus();
+loadTeam();
+</script>
+</body>
+</html>
+"""
+
+
 @app.route("/")
+@app.route("/app")
+def dashboard():
+    page = APP_HTML.replace("__DEFAULT_TEAM__", str(fpl.DEFAULT_TEAM_ID))
+    return Response(page, mimetype="text/html; charset=utf-8")
+
+
+@app.route("/api")
 def home():
     return jsonify(
         name="FPL API",
