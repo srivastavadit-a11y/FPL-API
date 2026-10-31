@@ -9,6 +9,7 @@ Endpoints (all return JSON unless noted):
     /api                   list of endpoints
     /status                current + next gameweek and deadlines
     /team/<id>             a manager's summary and squad  (optional ?gw=10)
+    /transfers/<id>        rule-based transfer ideas  (?ft=1&horizon=4&bank=3.6)
     /players               players list  (?sort=form&limit=20&position=MID&team=ARS)
     /fixtures              fixture difficulty per team  (?from_gw=12&n=5)
     /snapshot              full readable report as text/markdown (default team ID)
@@ -106,6 +107,84 @@ def player_dict(p, teams, fixtures=None, from_gw=None):
     return d
 
 
+# ---- Transfer suggestions (rule-based estimate, not an official FPL tool) ----
+DIFF_MULT = {1: 1.25, 2: 1.12, 3: 1.0, 4: 0.88, 5: 0.75}  # fixture difficulty -> points multiplier
+MIN_NET_GAIN = 2.0  # smallest net gain (points) worth acting on
+HIT_COST = 4
+
+
+def fixture_diffs(fixtures, team_id, from_gw, n):
+    """List of (gameweek, difficulty) for a team in the look-ahead window."""
+    out = []
+    for f in fixtures:
+        gw = f.get("event")
+        if gw is None or gw < from_gw or gw >= from_gw + n:
+            continue
+        if f["team_h"] == team_id:
+            out.append((gw, f["team_h_difficulty"]))
+        elif f["team_a"] == team_id:
+            out.append((gw, f["team_a_difficulty"]))
+    return out
+
+
+def first_gw_availability(p):
+    c = p.get("chance_of_playing_next_round")
+    if c is not None:
+        return c / 100.0
+    return {"a": 1.0, "d": 0.5}.get(p["status"], 0.0)
+
+
+def later_gw_availability(p):
+    return {"a": 1.0, "d": 0.9, "i": 0.5, "s": 0.5}.get(p["status"], 0.0)
+
+
+def project(p, diffs, first_gw, finished_gws):
+    """Rough projected points over the window: per-game rate x fixture difficulty x availability."""
+    share = min(1.0, p["minutes"] / (90.0 * finished_gws)) if finished_gws else 1.0
+    rate = 0.4 * float(p["ep_next"]) + 0.3 * float(p["form"]) + 0.3 * float(p["points_per_game"]) * share
+    first_av, later_av = first_gw_availability(p), later_gw_availability(p)
+    total = 0.0
+    for gw, d in diffs:
+        total += rate * DIFF_MULT.get(d, 1.0) * (first_av if gw == first_gw else later_av)
+    return round(total, 1)
+
+
+def selling_prices(squad_ids, players, transfers):
+    """FPL's rule: you keep half of any price rise (rounded down). Prices are in tenths of a million."""
+    last_in = {}
+    for t in transfers or []:
+        key = (t.get("event", 0), t.get("time", ""))
+        e = t["element_in"]
+        if e not in last_in or key >= last_in[e][0]:
+            last_in[e] = (key, t["element_in_cost"])
+    out = {}
+    for eid in squad_ids:
+        now = players[eid]["now_cost"]
+        buy = last_in[eid][1] if eid in last_in else now - players[eid].get("cost_change_start", 0)
+        out[eid] = now if now <= buy else buy + (now - buy) // 2
+    return out
+
+
+def brief(p, teams, fixtures, from_gw, n, projected, sell=None):
+    d = {
+        "id": p["id"],
+        "name": p["web_name"],
+        "team": teams[p["team"]]["short_name"],
+        "position": fpl.POSITIONS[p["element_type"]],
+        "price": p["now_cost"] / 10,
+        "projected_points": projected,
+        "form": float(p["form"]),
+        "expected_points_next": float(p["ep_next"]),
+        "next_fixtures": fpl.fixtures_text(fixtures, teams, p["team"], from_gw, n),
+        "status": p["status"],
+        "news": p.get("news") or "",
+        "chance_of_playing_next_round": p.get("chance_of_playing_next_round"),
+    }
+    if sell is not None:
+        d["sell_price"] = sell / 10
+    return d
+
+
 # ---- Endpoints ----
 APP_HTML = r"""<!doctype html>
 <html lang="en">
@@ -156,6 +235,18 @@ button.act{background:var(--accent);color:#fff;border:none;font-weight:600;curso
 .fxs{display:flex;gap:3px;justify-content:center;flex-wrap:wrap}
 .fx{font-size:11px;font-weight:600;padding:2px 5px;border-radius:5px;display:inline-block}
 .d1{background:#1b7f4b;color:#fff}.d2{background:#4cc27f;color:#06260f}.d3{background:#d9d9de;color:#222}.d4{background:#f08a4b;color:#2a1000}.d5{background:#d13b3b;color:#fff}
+.rec{border:2px solid var(--accent);border-radius:12px;padding:12px 14px;margin-bottom:14px}
+.rec.roll{border-color:var(--line)}
+.rec h3{margin:0 0 4px;font-size:17px}
+.move{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:10px 0;padding:8px;border:1px solid var(--line);border-radius:10px}
+.mv{flex:1 1 200px}
+.mv small{display:block;font-size:11px;font-weight:700;letter-spacing:.05em}
+.mv.out small{color:var(--warn)}.mv.in small{color:var(--accent)}
+.arrow{font-size:20px;color:var(--mute)}
+.gain{font-weight:700;font-size:18px;color:var(--accent);min-width:60px;text-align:right}
+.sell{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:10px 0}
+.sell h4{margin:0 0 2px;font-size:15px}
+.why{font-size:12px;color:var(--warn);margin-bottom:6px}
 .scroll{overflow-x:auto}
 table{border-collapse:collapse;width:100%;font-size:14px}
 th,td{padding:7px 9px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
@@ -172,6 +263,7 @@ textarea{width:100%;height:260px;font:12px/1.4 ui-monospace,Menlo,monospace;back
 </header>
 <nav id="tabs">
   <button class="on" data-tab="team">My Team</button>
+  <button data-tab="transfers">Transfers</button>
   <button data-tab="players">Players</button>
   <button data-tab="fixtures">Fixtures</button>
   <button data-tab="claude">For Claude</button>
@@ -184,6 +276,19 @@ textarea{width:100%;height:260px;font:12px/1.4 ui-monospace,Menlo,monospace;back
       <button class="act" id="loadTeam">Load team</button>
     </div>
     <div id="teamOut"></div>
+  </section>
+
+  <section id="transfers">
+    <div class="bar">
+      <label for="tFt">Free transfers</label>
+      <select id="tFt"><option>0</option><option selected>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+      <label for="tH">Look ahead</label>
+      <select id="tH"><option value="3">3 GWs</option><option value="4" selected>4 GWs</option><option value="5">5 GWs</option><option value="6">6 GWs</option></select>
+      <input id="tBank" placeholder="Bank £m (auto)" style="width:130px">
+      <button class="act" id="loadTransfers">Get suggestions</button>
+    </div>
+    <p class="legend">Uses the team ID from the My Team tab. FPL doesn't share your free transfers, so set them above.</p>
+    <div id="transfersOut"></div>
   </section>
 
   <section id="players">
@@ -335,6 +440,52 @@ async function loadTeam() {
   catch (e) { $('#teamOut').innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
 }
 
+/* ---------- Transfers ---------- */
+function playerLine(x, sell) {
+  const price = sell ? 'sell £' + x.sell_price.toFixed(1) + 'm' : '£' + x.price.toFixed(1) + 'm';
+  const note = (x.news && x.status !== 'a') ? ' ⚠ ' + esc(x.news) : '';
+  return `<b>${esc(x.name)}</b> ${esc(x.team)} ${esc(x.position)}<br><span class="sub">${price} · proj ${x.projected_points} pts · form ${x.form}${note}</span><div class="fxs">${fxChips(x.next_fixtures, 4)}</div>`;
+}
+function moveHtml(m) {
+  return `<div class="move"><div class="mv out"><small>SELL</small>${playerLine(m.out, true)}</div><div class="arrow">→</div>` +
+    `<div class="mv in"><small>BUY</small>${playerLine(m.in, false)}</div><div class="gain">+${m.gain}</div></div>`;
+}
+function renderTransfers(d) {
+  const r = d.recommendation;
+  let h = `<div class="rec ${r.action === 'make' ? '' : 'roll'}"><h3>${r.action === 'make' ? '✅ Suggested move' : '⏸ Roll your transfer'}</h3><div>${esc(r.summary)}</div>`;
+  if (r.action === 'make') {
+    h += r.moves.map(moveHtml).join('');
+    h += `<div class="sub">Gain +${r.gain} pts over ${d.horizon} GWs · hit −${r.hit_cost} · <b>net +${r.net_gain}</b></div>`;
+  }
+  h += '</div>';
+
+  const row = (n, o) => o ? `<tr><td>${n}</td><td>${o.moves.map(m => esc(m.out.name) + ' → ' + esc(m.in.name)).join(', ')}</td><td>+${o.gain}</td><td>−${o.hit_cost}</td><td><b>${o.net_gain >= 0 ? '+' : ''}${o.net_gain}</b></td></tr>` : '';
+  h += '<h3>Options compared</h3><div class="scroll"><table><tr><th>Option</th><th>Moves</th><th>Gain</th><th>Hit</th><th>Net</th></tr><tr><td>Roll</td><td>Keep your squad</td><td>0</td><td>0</td><td><b>0</b></td></tr>' +
+       row('Best 1 transfer', d.options.single) + row('Best 2 transfers', d.options.double) + '</table></div>';
+
+  h += '<h3>Who to sell, and the best replacements</h3>';
+  if (!d.sell_candidates.length) h += '<p class="msg">No clear upgrades found within budget.</p>';
+  d.sell_candidates.forEach(s => {
+    h += `<div class="sell"><h4>${esc(s.player.name)} <span class="sub">${esc(s.player.team)} ${esc(s.player.position)} · sell £${s.player.sell_price.toFixed(1)}m · proj ${s.player.projected_points} pts</span></h4>` +
+      (s.reasons.length ? `<div class="why">${s.reasons.map(esc).join(' · ')}</div>` : '') +
+      '<div class="scroll"><table><tr><th>Replacement</th><th>Price</th><th>Proj</th><th>Gain</th><th>Fixtures</th></tr>' +
+      s.alternatives.map(a => `<tr><td><b>${esc(a.in.name)}</b> ${esc(a.in.team)}</td><td>£${a.in.price.toFixed(1)}m</td><td>${a.in.projected_points}</td><td><b>+${a.gain}</b></td><td><div class="fxs" style="justify-content:flex-start">${fxChips(a.in.next_fixtures, 4)}</div></td></tr>`).join('') +
+      '</table></div></div>';
+  });
+  h += '<p class="legend">' + d.assumptions.map(esc).join('<br>') + '</p>';
+  $('#transfersOut').innerHTML = h;
+}
+async function loadTransfers() {
+  const id = $('#tid').value.trim();
+  if (!/^\d+$/.test(id)) { $('#transfersOut').innerHTML = '<p class="err">Enter your team ID on the My Team tab first.</p>'; return; }
+  const q = new URLSearchParams({ft: $('#tFt').value, horizon: $('#tH').value});
+  const bank = $('#tBank').value.trim();
+  if (bank) q.set('bank', bank);
+  $('#transfersOut').innerHTML = WAIT;
+  try { renderTransfers(await (await api('/transfers/' + id + '?' + q.toString())).json()); }
+  catch (e) { $('#transfersOut').innerHTML = '<p class="err">' + esc(e.message) + '</p>'; }
+}
+
 /* ---------- Players ---------- */
 async function loadPlayers() {
   const q = new URLSearchParams({sort: $('#pSort').value, limit: $('#pLimit').value});
@@ -393,12 +544,14 @@ document.querySelectorAll('#tabs button').forEach(b => b.addEventListener('click
   document.querySelectorAll('main section').forEach(s => s.classList.toggle('on', s.id === b.dataset.tab));
   if (!loaded[b.dataset.tab]) {
     loaded[b.dataset.tab] = true;
+    if (b.dataset.tab === 'transfers') loadTransfers();
     if (b.dataset.tab === 'players') loadPlayers();
     if (b.dataset.tab === 'fixtures') loadFixtures();
   }
 }));
 $('#loadTeam').addEventListener('click', loadTeam);
 $('#loadPlayers').addEventListener('click', loadPlayers);
+$('#loadTransfers').addEventListener('click', loadTransfers);
 $('#copySnap').addEventListener('click', copySnap);
 $('#tid').addEventListener('keydown', e => { if (e.key === 'Enter') loadTeam(); });
 try { const saved = localStorage.getItem('fpl_tid'); if (saved) $('#tid').value = saved; } catch (e) {}
@@ -424,6 +577,7 @@ def home():
         endpoints={
             "/status": "current and next gameweek",
             "/team/<id>": "manager summary + squad (?gw=)",
+            "/transfers/<id>": "rule-based transfer suggestions (?ft=&horizon=&bank=)",
             "/players": "player list (?sort=&limit=&position=&team=)",
             "/fixtures": "fixture difficulty per team (?from_gw=&n=)",
             "/snapshot": "full readable report (text)",
@@ -482,6 +636,144 @@ def team(team_id):
         gameweek_info=gw_info,
         squad=squad,
         note="Squad is as locked at the deadline; later transfers are not visible in FPL's public data.",
+    )
+
+
+@app.route("/transfers/<int:team_id>")
+def transfers_endpoint(team_id):
+    ft = max(0, min(request.args.get("ft", 1, type=int), 5))
+    horizon = max(1, min(request.args.get("horizon", 4, type=int), 8))
+    players, teams, events, current, upcoming = load_boot()
+    entry = fpl.get(f"entry/{team_id}/")
+    if not entry:
+        return jsonify(error="Team not found. Check the team ID."), 404
+    gw = request.args.get("gw", type=int) or (current["id"] if current else (upcoming["id"] if upcoming else 1))
+    picks = fpl.get(f"entry/{team_id}/event/{gw}/picks/")
+    if not picks:
+        return jsonify(error="Squad not available for this gameweek."), 404
+    fixtures = fpl.get("fixtures/") or []
+    transfers = fpl.get(f"entry/{team_id}/transfers/")
+    first_gw = upcoming["id"] if upcoming else gw
+    finished = sum(1 for e in events if e["finished"])
+    bank_arg = request.args.get("bank", type=float)
+    bank = int(round(bank_arg * 10)) if bank_arg is not None else entry["last_deadline_bank"]
+
+    diffs = {tid: fixture_diffs(fixtures, tid, first_gw, horizon) for tid in teams}
+    proj = {pid: project(p, diffs[p["team"]], first_gw, finished) for pid, p in players.items()}
+    squad = [players[pk["element"]] for pk in picks["picks"]]
+    squad_ids = {p["id"] for p in squad}
+    sells = selling_prices(squad_ids, players, transfers)
+    clubs = {}
+    for p in squad:
+        clubs[p["team"]] = clubs.get(p["team"], 0) + 1
+
+    pool = {1: [], 2: [], 3: [], 4: []}
+    for p in players.values():
+        if p["id"] in squad_ids or p["status"] not in ("a", "d") or first_gw_availability(p) < 0.75:
+            continue
+        if finished >= 3 and p["minutes"] < 0.3 * 90 * finished:
+            continue
+        pool[p["element_type"]].append(p)
+
+    moves = []  # (gain, out, in)
+    for out in squad:
+        budget = bank + sells[out["id"]]
+        for c in pool[out["element_type"]]:
+            if c["now_cost"] > budget:
+                continue
+            if c["team"] != out["team"] and clubs.get(c["team"], 0) >= 3:
+                continue
+            moves.append((round(proj[c["id"]] - proj[out["id"]], 1), out, c))
+    moves.sort(key=lambda m: m[0], reverse=True)
+    moves = [m for m in moves if m[0] > 0]
+
+    def move_json(g, o, c):
+        return {"gain": g,
+                "out": brief(o, teams, fixtures, first_gw, horizon, proj[o["id"]], sells[o["id"]]),
+                "in": brief(c, teams, fixtures, first_gw, horizon, proj[c["id"]])}
+
+    def option(ms):
+        gain = round(sum(m[0] for m in ms), 1)
+        hit = HIT_COST * max(0, len(ms) - ft)
+        return {"moves": [move_json(*m) for m in ms], "gain": gain, "hit_cost": hit, "net_gain": round(gain - hit, 1)}
+
+    single = option([moves[0]]) if moves else None
+
+    # best pair: top 4 replacements per player sold, then check budget and 3-per-club together
+    by_out = {}
+    for m in moves:
+        lst = by_out.setdefault(m[1]["id"], [])
+        if len(lst) < 4:
+            lst.append(m)
+    short = [m for lst in by_out.values() for m in lst]
+    best_pair = None
+    for i in range(len(short)):
+        for j in range(i + 1, len(short)):
+            g1, o1, c1 = short[i]
+            g2, o2, c2 = short[j]
+            if o1["id"] == o2["id"] or c1["id"] == c2["id"]:
+                continue
+            if c1["now_cost"] + c2["now_cost"] > bank + sells[o1["id"]] + sells[o2["id"]]:
+                continue
+            cnt = dict(clubs)
+            for o in (o1, o2):
+                cnt[o["team"]] -= 1
+            for c in (c1, c2):
+                cnt[c["team"]] = cnt.get(c["team"], 0) + 1
+            if any(v > 3 for v in cnt.values()):
+                continue
+            if best_pair is None or g1 + g2 > best_pair[0]:
+                best_pair = (g1 + g2, [short[i], short[j]])
+    double = option(best_pair[1]) if best_pair else None
+
+    best = max([o for o in (single, double) if o], key=lambda o: o["net_gain"], default=None)
+    if best and best["net_gain"] >= MIN_NET_GAIN:
+        parts = [f"Sell {m['out']['name']} (£{m['out']['sell_price']:.1f}m), buy {m['in']['name']} (£{m['in']['price']:.1f}m)" for m in best["moves"]]
+        if best["hit_cost"]:
+            hit_txt = f"costs a hit of {best['hit_cost']} points"
+        else:
+            hit_txt = "uses your free transfers" if len(best["moves"]) > 1 else "uses your free transfer"
+        rec = {"action": "make", "summary": "; ".join(parts) + f". Projected +{best['gain']} pts over {horizon} GWs; {hit_txt}.",
+               **{k: best[k] for k in ("moves", "gain", "hit_cost", "net_gain")}}
+    else:
+        top = f" The best available move gains only +{best['net_gain']} net." if best else ""
+        rec = {"action": "roll", "moves": [], "gain": 0, "hit_cost": 0, "net_gain": 0,
+               "summary": f"Nothing clears the +{MIN_NET_GAIN:g} point bar over {horizon} GWs, so hold your squad and keep the free transfer.{top}"}
+
+    sell_candidates = []
+    for pid, lst in by_out.items():
+        o = lst[0][1]
+        reasons = []
+        if first_gw_availability(o) < 0.75:
+            reasons.append("Availability concern" + (": " + o["news"] if o.get("news") else ""))
+        d_list = diffs[o["team"]]
+        if not d_list:
+            reasons.append("No fixtures in this window")
+        elif sum(d for _, d in d_list) / len(d_list) >= 3.6:
+            reasons.append("Tough fixtures")
+        if float(o["form"]) < 3:
+            reasons.append("Poor form")
+        sell_candidates.append(((first_gw_availability(o) < 0.75, lst[0][0]), {"player": brief(o, teams, fixtures, first_gw, horizon, proj[pid], sells[pid]),
+                                            "reasons": reasons,
+                                            "alternatives": [{"gain": g, "in": brief(c, teams, fixtures, first_gw, horizon, proj[c["id"]])} for g, _, c in lst[:3]]}))
+    sell_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    return jsonify(
+        team_id=team_id,
+        team_name=entry["name"],
+        gameweeks=[first_gw + i for i in range(horizon)],
+        horizon=horizon,
+        free_transfers=ft,
+        bank=bank / 10,
+        recommendation=rec,
+        options={"single": single, "double": double},
+        sell_candidates=[s for _, s in sell_candidates[:6]],
+        assumptions=[
+            "Projections are a simple rule-based estimate (form, FPL expected points, points per game, fixture difficulty, availability), not an official FPL forecast.",
+            "Selling prices are estimated from your transfer history using FPL's keep-half-the-profit rule.",
+            "Squad and bank are as locked at the last deadline. Set your real free transfers and bank if they differ.",
+            f"A move is only suggested if it nets at least +{MIN_NET_GAIN:g} points after any {HIT_COST}-point hit. Rolling a free transfer also has value.",
+        ],
     )
 
 
